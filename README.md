@@ -1,5 +1,8 @@
 # Exuvia-Counting
 Exuvia Counting
 
-To count eggs
-Fortnite Balls
+Capstone Project 2025-2026 Group I26
+
+OKSIR 
+
+Exuvia shell counting with camera with trained model

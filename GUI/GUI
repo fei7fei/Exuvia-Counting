@@ -1,0 +1,163 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+from datetime import datetime
+from pathlib import Path
+import pandas as pd
+import subprocess
+import sys
+import random
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _safe_load_image(path, size=(300, 300)):
+    try:
+        img = Image.open(path)
+        img = img.resize(size)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        return None
+
+
+def _create_or_get_excel(path, date_str, batch_str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return path
+    df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
+    df.loc[0] = [date_str, batch_str, datetime.now().isoformat(sep=" ", timespec="seconds"), ""]
+    df.to_excel(path, index=False)
+    return path
+
+
+def _append_to_excel(path, date_str, batch_str, value):
+    if path.exists():
+        try:
+            df = pd.read_excel(path)
+        except Exception:
+            df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
+    else:
+        df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
+    df = df.append({"Date": date_str, "Batch": batch_str, "Timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"), "Value": value}, ignore_index=True)
+    df.to_excel(path, index=False)
+
+
+def _get_scan_value():
+    scan_script = BASE_DIR / "scan_program.py"
+    if scan_script.exists():
+        try:
+            proc = subprocess.run([sys.executable, str(scan_script)], capture_output=True, text=True, check=True, timeout=10)
+            out = proc.stdout.strip() or proc.stderr.strip()
+            try:
+                if "." in out:
+                    return float(out)
+                return int(out)
+            except Exception:
+                return out
+        except Exception:
+            pass
+    exec_path = BASE_DIR / "scan_program.exe"
+    if exec_path.exists():
+        try:
+            proc = subprocess.run([str(exec_path)], capture_output=True, text=True, check=True, timeout=10)
+            out = proc.stdout.strip() or proc.stderr.strip()
+            try:
+                if "." in out:
+                    return float(out)
+                return int(out)
+            except Exception:
+                return out
+        except Exception:
+            pass
+    return random.randint(1, 999)
+
+
+class BatchSetupWindow:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Batch Setup")
+        self.root.geometry("500x600")
+
+        # Load image
+        photo = _safe_load_image(BASE_DIR / "oksir.png")
+        if photo:
+            img_label = tk.Label(root, image=photo, bg="lightgray")
+            img_label.image = photo
+        else:
+            img_label = tk.Label(root, text="[Logo placeholder]", bg="lightgray", font=("Segoe UI", 14))
+        img_label.pack(pady=(15, 5))
+
+        # Title under logo
+        title_label = tk.Label(
+            root,
+            text="Exuvia Counting Program",
+            font=("Georgia", 18, "bold")
+        )
+        title_label.pack(pady=(0, 20))
+
+        # Date selection
+        date_frame = tk.Frame(root)
+        date_frame.pack(pady=10, padx=10, fill=tk.X)
+        tk.Label(date_frame, text="Date:").pack(side=tk.LEFT)
+        self.date_entry = tk.Entry(date_frame)
+        self.date_entry.pack(side=tk.LEFT, padx=5)
+        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+        # Batch number input
+        batch_frame = tk.Frame(root)
+        batch_frame.pack(pady=10, padx=10, fill=tk.X)
+        tk.Label(batch_frame, text="Batch Number:").pack(side=tk.LEFT)
+        self.batch_entry = tk.Entry(batch_frame)
+        self.batch_entry.pack(side=tk.LEFT, padx=5)
+
+        # New Batch button
+        tk.Button(root, text="NEW BATCH", command=self.start_program, bg="Grey", fg="white", font=("Arial", 12)).pack(pady=20)
+
+        self.batch_file = None
+
+    def start_program(self):
+        date_val = self.date_entry.get().strip()
+        batch_val = self.batch_entry.get().strip()
+        if not date_val:
+            messagebox.showwarning("Missing date", "Please enter a date.")
+            return
+        if not batch_val:
+            messagebox.showwarning("Missing batch number", "Please enter a batch number.")
+            return
+
+        safe_date = date_val.replace("/", "-")
+        fname = f"batch_{batch_val}_{safe_date}.xlsx"
+        file_path = BASE_DIR / fname
+        _create_or_get_excel(file_path, date_val, batch_val)
+        self.batch_file = file_path
+
+        open_scan_window(self.batch_file, date_val, batch_val)
+
+
+def open_scan_window(batch_file, date_str, batch_str):
+    scan_root = tk.Toplevel()
+    scan_root.title("Scanning")
+    scan_root.geometry("600x700")
+
+    # Video feed placeholder
+    video_label = tk.Label(scan_root, text="[Live Video Feed Placeholder]", bg="black", fg="white", height=15)
+    video_label.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+    status_label = tk.Label(scan_root, text="Ready", anchor="w")
+    status_label.pack(fill=tk.X, padx=8)
+
+    def do_scan():
+        status_label.config(text="Scanning...")
+        scan_val = _get_scan_value()
+        _append_to_excel(batch_file, date_str, batch_str, scan_val)
+        status_label.config(text=f"Last scan: {scan_val} at {datetime.now().strftime('%H:%M:%S')}")
+        messagebox.showinfo("Scan", f"Scan recorded: {scan_val}")
+
+    tk.Button(scan_root, text="SCAN", command=do_scan, bg="green", fg="white", font=("Arial", 12)).pack(pady=20)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BatchSetupWindow(root)
+    root.mainloop()

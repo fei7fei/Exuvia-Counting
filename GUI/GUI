@@ -10,6 +10,11 @@ import random
 import json
 import os
 import platform
+import matplotlib
+
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -57,31 +62,57 @@ def _open_folder(path: Path):
         messagebox.showerror("Error", f"Couldn't open folder:\n{path}")
 
 
-def _create_or_get_excel(path, date_str, batch_str):
+def _create_or_get_excel(path: Path, batch_str: str):
+    """
+    Creates a new Excel file if it doesn't exist using the schema:
+    Timestamp | Batch | Value
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return path
-    df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
-    df.loc[0] = [date_str, batch_str, datetime.now().isoformat(sep=" ", timespec="seconds"), ""]
+
+    df = pd.DataFrame(columns=["Timestamp", "Batch", "Value"])
+    df.loc[0] = [datetime.now().isoformat(sep=" ", timespec="seconds"), batch_str, ""]
     df.to_excel(path, index=False)
     return path
 
 
-def _append_to_excel(path, date_str, batch_str, value):
-    if path.exists():
-        try:
-            df = pd.read_excel(path)
-        except Exception:
-            df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
-    else:
-        df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
+def _read_excel_df(path: Path) -> pd.DataFrame:
+    """
+    Reads an Excel file and normalizes it to the expected schema:
+    Timestamp | Batch | Value
+
+    Also supports older schemas gracefully.
+    """
+    expected = ["Timestamp", "Batch", "Value"]
+    try:
+        df = pd.read_excel(path)
+    except Exception:
+        return pd.DataFrame(columns=expected)
+
+    # Handle older schema possibilities
+    if "Timestamp" not in df.columns and "Date Timestamp" in df.columns:
+        df["Timestamp"] = df["Date Timestamp"]
+    if "Timestamp" not in df.columns and "Date" in df.columns:
+        df["Timestamp"] = df["Date"].astype(str)
+
+    for c in expected:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[expected]
+    return df
+
+
+def _append_to_excel(path: Path, batch_str: str, value):
+    df = _read_excel_df(path)
 
     new_row = pd.DataFrame([{
-        "Date": date_str,
-        "Batch": batch_str,
         "Timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        "Batch": batch_str,
         "Value": value
     }])
+
     df = pd.concat([df, new_row], ignore_index=True)
     df.to_excel(path, index=False)
 
@@ -92,7 +123,10 @@ def _get_scan_value():
         try:
             proc = subprocess.run(
                 [sys.executable, str(scan_script)],
-                capture_output=True, text=True, check=True, timeout=10
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10
             )
             out = proc.stdout.strip() or proc.stderr.strip()
             try:
@@ -107,7 +141,13 @@ def _get_scan_value():
     exec_path = BASE_DIR / "scan_program.exe"
     if exec_path.exists():
         try:
-            proc = subprocess.run([str(exec_path)], capture_output=True, text=True, check=True, timeout=10)
+            proc = subprocess.run(
+                [str(exec_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10
+            )
             out = proc.stdout.strip() or proc.stderr.strip()
             try:
                 if "." in out:
@@ -148,29 +188,14 @@ class BatchSetupWindow:
         )
         title_label.pack(pady=(0, 20))
 
-        # Date selection
-        date_frame = tk.Frame(root)
-        date_frame.pack(pady=10, padx=10, fill=tk.X)
-        tk.Label(date_frame, text="Date:").pack(side=tk.LEFT)
-        self.date_entry = tk.Entry(date_frame)
-        self.date_entry.pack(side=tk.LEFT, padx=5)
-        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
-
-        # Batch number input
-        batch_frame = tk.Frame(root)
-        batch_frame.pack(pady=10, padx=10, fill=tk.X)
-        tk.Label(batch_frame, text="Batch Number:").pack(side=tk.LEFT)
-        self.batch_entry = tk.Entry(batch_frame)
-        self.batch_entry.pack(side=tk.LEFT, padx=5)
-
-        # Buttons
+        # Buttons only (no batch entry on first UI)
         btn_frame = tk.Frame(root)
         btn_frame.pack(pady=20)
 
         tk.Button(
             btn_frame,
             text="NEW BATCH",
-            command=self.start_program,
+            command=self.new_batch_flow,
             bg="Grey", fg="white",
             font=("Arial", 12),
             width=16
@@ -179,13 +204,11 @@ class BatchSetupWindow:
         tk.Button(
             btn_frame,
             text="EXISTING BATCH",
-            command=self.open_existing_batches_folder,
+            command=self.select_existing_batch,
             bg="Grey", fg="white",
             font=("Arial", 12),
             width=16
         ).grid(row=0, column=1, padx=10)
-
-        self.batch_file = None
 
     def _ensure_batches_dir(self) -> bool:
         """Ensure we have a batches folder. If not, prompt user to select one and save it."""
@@ -204,55 +227,239 @@ class BatchSetupWindow:
         _save_settings(settings)
         return True
 
-    def open_existing_batches_folder(self):
-        if not self._ensure_batches_dir():
-            return
-        _open_folder(self.batches_dir)
+    def _ask_batch_number_dialog(self) -> str | None:
+        """Modal dialog to ask for batch number after clicking NEW BATCH."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New Batch")
+        dlg.geometry("320x140")
+        dlg.transient(self.root)
+        dlg.grab_set()
 
-    def start_program(self):
+        tk.Label(dlg, text="Enter Batch Number:", font=("Segoe UI", 11)).pack(pady=(15, 5))
+        entry = tk.Entry(dlg, font=("Segoe UI", 11))
+        entry.pack(pady=5)
+        entry.focus_set()
+
+        result = {"val": None}
+
+        def ok():
+            val = entry.get().strip()
+            if not val:
+                messagebox.showwarning("Missing batch number", "Please enter a batch number.", parent=dlg)
+                return
+            result["val"] = val
+            dlg.destroy()
+
+        def cancel():
+            dlg.destroy()
+
+        btns = tk.Frame(dlg)
+        btns.pack(pady=10)
+        tk.Button(btns, text="Cancel", command=cancel, width=10).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btns, text="OK", command=ok, width=10).pack(side=tk.RIGHT, padx=5)
+
+        dlg.wait_window()
+        return result["val"]
+
+    def new_batch_flow(self):
         if not self._ensure_batches_dir():
-            messagebox.showwarning("Missing folder", "Please select a folder to save batches in.")
+            messagebox.showwarning("Missing folder", "Please select a folder to save batches in.", parent=self.root)
             return
 
-        date_val = self.date_entry.get().strip()
-        batch_val = self.batch_entry.get().strip()
-        if not date_val:
-            messagebox.showwarning("Missing date", "Please enter a date.")
-            return
+        batch_val = self._ask_batch_number_dialog()
         if not batch_val:
-            messagebox.showwarning("Missing batch number", "Please enter a batch number.")
             return
 
-        safe_date = date_val.replace("/", "-")
-        fname = f"batch_{batch_val}_{safe_date}.xlsx"
+        fname = f"batch_{batch_val}.xlsx"
         file_path = self.batches_dir / fname
 
-        _create_or_get_excel(file_path, date_val, batch_val)
-        self.batch_file = file_path
+        _create_or_get_excel(file_path, batch_val)
+        open_scan_window(self.root, file_path, batch_val)
 
-        open_scan_window(self.batch_file, date_val, batch_val)
+    def select_existing_batch(self):
+        if not self._ensure_batches_dir():
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="Select an existing batch Excel file",
+            initialdir=str(self.batches_dir),
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        batch_file = Path(file_path)
+
+        # Infer batch from file contents, then filename, then "?"
+        batch_str = None
+        try:
+            df = pd.read_excel(batch_file)
+            if not df.empty and "Batch" in df.columns and pd.notna(df.loc[0, "Batch"]):
+                batch_str = str(df.loc[0, "Batch"])
+        except Exception:
+            pass
+
+        if not batch_str:
+            parts = batch_file.stem.split("_")
+            if len(parts) >= 2 and parts[0].lower() == "batch":
+                batch_str = parts[1]
+
+        if not batch_str:
+            batch_str = "?"
+
+        open_scan_window(self.root, batch_file, batch_str)
 
 
-def open_scan_window(batch_file, date_str, batch_str):
-    scan_root = tk.Toplevel()
+def open_scan_window(parent, batch_file: Path, batch_str: str):
+    scan_root = tk.Toplevel(parent)
     scan_root.title("Scanning")
-    scan_root.geometry("600x700")
+    scan_root.geometry("1100x700")
 
-    # Video feed placeholder
-    video_label = tk.Label(scan_root, text="[Live Video Feed Placeholder]", bg="black", fg="white", height=15)
-    video_label.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+    # Keep focus sane / avoid main window jumping forward
+    scan_root.transient(parent)
+    scan_root.lift()
+    scan_root.focus_force()
 
-    status_label = tk.Label(scan_root, text="Ready", anchor="w")
-    status_label.pack(fill=tk.X, padx=8)
+    # ---- Layout: left (video), right (data+plot) ----
+    outer = tk.Frame(scan_root)
+    outer.pack(fill=tk.BOTH, expand=True)
+
+    outer.columnconfigure(0, weight=3)  # LEFT = wider (video)
+    outer.columnconfigure(1, weight=2)  # RIGHT = narrower (data)
+
+    outer.rowconfigure(0, weight=1)
+
+    left = tk.Frame(outer)
+    left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+
+    right = tk.Frame(outer)
+    right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+
+    # ---- Left: Video feed placeholder ----
+    video_label = tk.Label(
+        left,
+        text="[Live Video Feed Placeholder]",
+        bg="black",
+        fg="white",
+        height=15
+    )
+    video_label.pack(fill=tk.BOTH, expand=True)
+
+    status_label = tk.Label(scan_root, text=f"Ready • File: {batch_file.name}", anchor="w")
+    status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+    # ---- Right: Excel data table (Treeview) ----
+    table_title = tk.Label(right, text="Batch Data (Excel)", font=("Segoe UI", 12, "bold"))
+    table_title.pack(anchor="w")
+
+    table_frame = tk.Frame(right)
+    table_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 10))
+
+    columns = ("Timestamp", "Batch", "Value")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+    widths = {"Timestamp": 220, "Batch": 120, "Value": 120}
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=widths.get(col, 140), anchor="w")
+
+    vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ---- Right: Matplotlib line plot ----
+    plot_title = tk.Label(right, text="Scan Values (Line Graph)", font=("Segoe UI", 12, "bold"))
+    plot_title.pack(anchor="w", pady=(0, 5))
+
+    fig = Figure(figsize=(5.2, 3.2), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Scan #")
+    ax.set_ylabel("Value")
+
+    canvas = FigureCanvasTkAgg(fig, master=right)
+    canvas_widget = canvas.get_tk_widget()
+    canvas_widget.pack(fill=tk.BOTH, expand=False)
+
+    def refresh_table_and_plot():
+        df = _read_excel_df(batch_file)
+
+        # Table
+        for item in tree.get_children():
+            tree.delete(item)
+
+        for _, row in df.iterrows():
+            tree.insert("", tk.END, values=(
+                row.get("Timestamp", ""),
+                row.get("Batch", ""),
+                row.get("Value", "")
+            ))
+
+        children = tree.get_children()
+        if children:
+            tree.see(children[-1])
+
+        # Plot
+        vals = pd.to_numeric(df["Value"], errors="coerce").dropna().tolist()
+
+        ax.clear()
+        ax.set_xlabel("Scan #")
+        ax.set_ylabel("Value")
+
+        if vals:
+            x = list(range(1, len(vals) + 1))
+            ax.plot(x, vals, marker="o")
+            ax.set_xlim(1, max(2, len(vals)))
+        else:
+            ax.text(0.5, 0.5, "No numeric scan values yet", ha="center", va="center", transform=ax.transAxes)
+
+        ax.grid(True, linewidth=0.5, alpha=0.4)
+        fig.tight_layout()
+        canvas.draw()
 
     def do_scan():
         status_label.config(text="Scanning...")
         scan_val = _get_scan_value()
-        _append_to_excel(batch_file, date_str, batch_str, scan_val)
-        status_label.config(text=f"Last scan: {scan_val} at {datetime.now().strftime('%H:%M:%S')}")
-        messagebox.showinfo("Scan", f"Scan recorded: {scan_val}")
+        _append_to_excel(batch_file, batch_str, scan_val)
 
-    tk.Button(scan_root, text="SCAN", command=do_scan, bg="green", fg="white", font=("Arial", 12)).pack(pady=20)
+        status_label.config(
+            text=f"Last scan: {scan_val} at {datetime.now().strftime('%H:%M:%S')} • File: {batch_file.name}"
+        )
+        refresh_table_and_plot()
+
+        # keep scan window in front
+        scan_root.lift()
+        scan_root.focus_force()
+
+    # Buttons row
+    btn_row = tk.Frame(left)
+    btn_row.pack(fill=tk.X, pady=(10, 0))
+
+    tk.Button(
+        btn_row,
+        text="SCAN",
+        command=do_scan,
+        bg="green",
+        fg="white",
+        font=("Arial", 12),
+        width=12
+    ).pack(side=tk.LEFT)
+
+    tk.Button(
+        btn_row,
+        text="Open Excel Folder",
+        command=lambda: _open_folder(Path(batch_file).parent),
+        width=16
+    ).pack(side=tk.LEFT, padx=10)
+
+    tk.Button(
+        btn_row,
+        text="Refresh",
+        command=refresh_table_and_plot,
+        width=10
+    ).pack(side=tk.LEFT)
+
+    refresh_table_and_plot()
 
 
 if __name__ == "__main__":

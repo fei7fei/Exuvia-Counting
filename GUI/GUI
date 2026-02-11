@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 from datetime import datetime
 from pathlib import Path
@@ -7,9 +7,13 @@ import pandas as pd
 import subprocess
 import sys
 import random
+import json
+import os
+import platform
 
 
 BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_PATH = BASE_DIR / "settings.json"
 
 
 def _safe_load_image(path, size=(300, 300)):
@@ -19,6 +23,38 @@ def _safe_load_image(path, size=(300, 300)):
         return ImageTk.PhotoImage(img)
     except Exception:
         return None
+
+
+def _load_settings():
+    if SETTINGS_PATH.exists():
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_settings(settings: dict):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
+
+
+def _open_folder(path: Path):
+    """Open a folder in the OS file explorer."""
+    try:
+        path = path.resolve()
+        if platform.system() == "Windows":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception:
+        messagebox.showerror("Error", f"Couldn't open folder:\n{path}")
 
 
 def _create_or_get_excel(path, date_str, batch_str):
@@ -39,7 +75,14 @@ def _append_to_excel(path, date_str, batch_str, value):
             df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
     else:
         df = pd.DataFrame(columns=["Date", "Batch", "Timestamp", "Value"])
-    df = df.append({"Date": date_str, "Batch": batch_str, "Timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"), "Value": value}, ignore_index=True)
+
+    new_row = pd.DataFrame([{
+        "Date": date_str,
+        "Batch": batch_str,
+        "Timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        "Value": value
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
     df.to_excel(path, index=False)
 
 
@@ -47,7 +90,10 @@ def _get_scan_value():
     scan_script = BASE_DIR / "scan_program.py"
     if scan_script.exists():
         try:
-            proc = subprocess.run([sys.executable, str(scan_script)], capture_output=True, text=True, check=True, timeout=10)
+            proc = subprocess.run(
+                [sys.executable, str(scan_script)],
+                capture_output=True, text=True, check=True, timeout=10
+            )
             out = proc.stdout.strip() or proc.stderr.strip()
             try:
                 if "." in out:
@@ -57,6 +103,7 @@ def _get_scan_value():
                 return out
         except Exception:
             pass
+
     exec_path = BASE_DIR / "scan_program.exe"
     if exec_path.exists():
         try:
@@ -70,6 +117,7 @@ def _get_scan_value():
                 return out
         except Exception:
             pass
+
     return random.randint(1, 999)
 
 
@@ -78,6 +126,10 @@ class BatchSetupWindow:
         self.root = root
         self.root.title("Batch Setup")
         self.root.geometry("500x600")
+
+        # Load saved batches folder (if any)
+        settings = _load_settings()
+        self.batches_dir = Path(settings["batches_dir"]) if settings.get("batches_dir") else None
 
         # Load image
         photo = _safe_load_image(BASE_DIR / "oksir.png")
@@ -111,12 +163,57 @@ class BatchSetupWindow:
         self.batch_entry = tk.Entry(batch_frame)
         self.batch_entry.pack(side=tk.LEFT, padx=5)
 
-        # New Batch button
-        tk.Button(root, text="NEW BATCH", command=self.start_program, bg="Grey", fg="white", font=("Arial", 12)).pack(pady=20)
+        # Buttons
+        btn_frame = tk.Frame(root)
+        btn_frame.pack(pady=20)
+
+        tk.Button(
+            btn_frame,
+            text="NEW BATCH",
+            command=self.start_program,
+            bg="Grey", fg="white",
+            font=("Arial", 12),
+            width=16
+        ).grid(row=0, column=0, padx=10)
+
+        tk.Button(
+            btn_frame,
+            text="EXISTING BATCH",
+            command=self.open_existing_batches_folder,
+            bg="Grey", fg="white",
+            font=("Arial", 12),
+            width=16
+        ).grid(row=0, column=1, padx=10)
 
         self.batch_file = None
 
+    def _ensure_batches_dir(self) -> bool:
+        """Ensure we have a batches folder. If not, prompt user to select one and save it."""
+        if self.batches_dir and self.batches_dir.exists():
+            return True
+
+        chosen = filedialog.askdirectory(title="Select folder to save batches in")
+        if not chosen:
+            return False
+
+        self.batches_dir = Path(chosen)
+        self.batches_dir.mkdir(parents=True, exist_ok=True)
+
+        settings = _load_settings()
+        settings["batches_dir"] = str(self.batches_dir)
+        _save_settings(settings)
+        return True
+
+    def open_existing_batches_folder(self):
+        if not self._ensure_batches_dir():
+            return
+        _open_folder(self.batches_dir)
+
     def start_program(self):
+        if not self._ensure_batches_dir():
+            messagebox.showwarning("Missing folder", "Please select a folder to save batches in.")
+            return
+
         date_val = self.date_entry.get().strip()
         batch_val = self.batch_entry.get().strip()
         if not date_val:
@@ -128,7 +225,8 @@ class BatchSetupWindow:
 
         safe_date = date_val.replace("/", "-")
         fname = f"batch_{batch_val}_{safe_date}.xlsx"
-        file_path = BASE_DIR / fname
+        file_path = self.batches_dir / fname
+
         _create_or_get_excel(file_path, date_val, batch_val)
         self.batch_file = file_path
 

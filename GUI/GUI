@@ -16,10 +16,8 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "settings.json"
-
 
 def _safe_load_image(path, size=(300, 300)):
     try:
@@ -28,7 +26,6 @@ def _safe_load_image(path, size=(300, 300)):
         return ImageTk.PhotoImage(img)
     except Exception:
         return None
-
 
 def _load_settings():
     if SETTINGS_PATH.exists():
@@ -39,14 +36,12 @@ def _load_settings():
             return {}
     return {}
 
-
 def _save_settings(settings: dict):
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
     except Exception:
         pass
-
 
 def _open_folder(path: Path):
     """Open a folder in the OS file explorer."""
@@ -60,7 +55,6 @@ def _open_folder(path: Path):
             subprocess.run(["xdg-open", str(path)], check=False)
     except Exception:
         messagebox.showerror("Error", f"Couldn't open folder:\n{path}")
-
 
 def _create_or_get_excel(path: Path, batch_str: str):
     """
@@ -76,7 +70,6 @@ def _create_or_get_excel(path: Path, batch_str: str):
     df.to_excel(path, index=False)
     return path
 
-
 def _read_excel_df(path: Path) -> pd.DataFrame:
     """
     Reads an Excel file and normalizes it to the expected schema:
@@ -90,7 +83,6 @@ def _read_excel_df(path: Path) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=expected)
 
-    # Handle older schema possibilities
     if "Timestamp" not in df.columns and "Date Timestamp" in df.columns:
         df["Timestamp"] = df["Date Timestamp"]
     if "Timestamp" not in df.columns and "Date" in df.columns:
@@ -102,7 +94,6 @@ def _read_excel_df(path: Path) -> pd.DataFrame:
 
     df = df[expected]
     return df
-
 
 def _append_to_excel(path: Path, batch_str: str, value):
     df = _read_excel_df(path)
@@ -116,6 +107,200 @@ def _append_to_excel(path: Path, batch_str: str, value):
     df = pd.concat([df, new_row], ignore_index=True)
     df.to_excel(path, index=False)
 
+def open_scan_window(parent, batch_file: Path, batch_str: str):
+    scan_root = tk.Toplevel(parent)
+    scan_root.title("Scanning")
+    scan_root.geometry("1400x800")
+
+    scan_root.transient(parent)
+    scan_root.lift()
+    scan_root.focus_force()
+
+    outer = tk.Frame(scan_root)
+    outer.pack(fill=tk.BOTH, expand=True)
+
+    outer.columnconfigure(0, weight=4)
+    outer.columnconfigure(1, weight=1)
+    outer.rowconfigure(0, weight=1)
+
+    left = tk.Frame(outer)
+    left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+
+    right = tk.Frame(outer)
+    right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+
+    video_label = tk.Label(left, text="[Live Video Feed Placeholder]", bg="black", fg="white")
+    video_label.pack(fill=tk.BOTH, expand=True)
+
+    status_label = tk.Label(scan_root, text=f"Ready • File: {batch_file.name}", anchor="w")
+    status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+    # ---- Table ----
+    tk.Label(right, text="Batch Data", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
+    table_frame = tk.Frame(right)
+    table_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 10))
+
+    columns = ("Row", "Timestamp", "Batch", "Value")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+
+    widths = {"Row": 55, "Timestamp": 220, "Batch": 90, "Value": 90}
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=widths[col], anchor="w")
+
+    vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ---- Plot ----
+    tk.Label(right, text="Scan Values", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
+
+    fig = Figure(figsize=(5.2, 3.5), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Scan #")
+    ax.set_ylabel("Value")
+
+    canvas = FigureCanvasTkAgg(fig, master=right)
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=False)
+
+    # ---- Data cache + dirty flag ----
+    df_cache = _read_excel_df(batch_file)   # expected schema: Timestamp | Batch | Value
+    dirty = False
+
+    def _set_status(msg: str):
+        suffix = " • Unsaved changes" if dirty else ""
+        status_label.config(text=msg + suffix)
+
+    def _write_df_to_excel() -> bool:
+        nonlocal dirty
+        try:
+            df_cache.to_excel(batch_file, index=False)
+            dirty = False
+            _set_status(f"Saved • File: {batch_file.name}")
+            return True
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save Excel file:\n{e}", parent=scan_root)
+            return False
+
+    def refresh_table_and_plot():
+        # Table
+        for item in tree.get_children():
+            tree.delete(item)
+
+        for i, row in df_cache.iterrows():
+            tree.insert("", tk.END, values=(
+                i + 1,
+                row.get("Timestamp", ""),
+                row.get("Batch", ""),
+                row.get("Value", "")
+            ))
+
+        children = tree.get_children()
+        if children:
+            tree.see(children[-1])
+
+        # Plot
+        vals = pd.to_numeric(df_cache["Value"], errors="coerce").dropna().tolist()
+
+        ax.clear()
+        ax.set_xlabel("Scan #")
+        ax.set_ylabel("Value")
+
+        if vals:
+            x = list(range(1, len(vals) + 1))
+            ax.plot(x, vals, marker="o")
+            ax.set_xlim(1, max(2, len(vals)))
+        else:
+            ax.text(0.5, 0.5, "No numeric scan values yet", ha="center", va="center", transform=ax.transAxes)
+
+        ax.grid(True, linewidth=0.5, alpha=0.4)
+        fig.tight_layout()
+        canvas.draw()
+
+    def do_scan():
+        nonlocal dirty
+        _set_status("Scanning...")
+
+        scan_val = _get_scan_value()
+        df_cache.loc[len(df_cache)] = [
+            datetime.now().isoformat(sep=" ", timespec="seconds"),
+            batch_str,
+            scan_val
+        ]
+
+        # Auto-save scans for safety; deletes require SAVE
+        ok = _write_df_to_excel()
+        if ok:
+            status_label.config(text=f"Last scan: {scan_val} at {datetime.now().strftime('%H:%M:%S')} • Saved • File: {batch_file.name}")
+
+        refresh_table_and_plot()
+        scan_root.lift()
+        scan_root.focus_force()
+
+    def delete_selected():
+        nonlocal dirty
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("No selection", "Select a scan row to delete.", parent=scan_root)
+            return
+
+        vals = tree.item(sel[0], "values")
+        if not vals:
+            return
+
+        try:
+            row_num = int(vals[0])  # 1-based
+        except Exception:
+            messagebox.showerror("Delete Error", "Could not determine selected row number.", parent=scan_root)
+            return
+
+        idx = row_num - 1
+        if idx < 0 or idx >= len(df_cache):
+            messagebox.showerror("Delete Error", "Selected row is out of range.", parent=scan_root)
+            return
+
+        df_cache.drop(index=idx, inplace=True)
+        df_cache.reset_index(drop=True, inplace=True)
+        dirty = True
+
+        _set_status(f"Deleted row {row_num} • File: {batch_file.name}")
+        refresh_table_and_plot()
+        scan_root.lift()
+        scan_root.focus_force()
+
+    def save_changes():
+        if not dirty:
+            _set_status("No unsaved changes • File: " + batch_file.name)
+            return
+        _write_df_to_excel()
+        refresh_table_and_plot()
+        scan_root.lift()
+        scan_root.focus_force()
+
+    def reload_from_disk():
+        nonlocal dirty
+        df_cache.drop(df_cache.index, inplace=True)
+        df_new = _read_excel_df(batch_file)
+        for col in df_new.columns:
+            df_cache[col] = df_new[col]
+        df_cache.drop(df_cache.index[len(df_new):], inplace=True)  # safety
+        dirty = False
+        _set_status(f"Reloaded • File: {batch_file.name}")
+        refresh_table_and_plot()
+
+    # ---- Buttons ----
+    btn_row = tk.Frame(left)
+    btn_row.pack(fill=tk.X, pady=(10, 0))
+
+    tk.Button(btn_row, text="SCAN", command=do_scan, bg="green", fg="white", font=("Arial", 12), width=12).pack(side=tk.LEFT)
+    tk.Button(btn_row, text="DELETE SELECTED", command=delete_selected, width=16).pack(side=tk.LEFT, padx=10)
+    tk.Button(btn_row, text="SAVE", command=save_changes, width=10).pack(side=tk.LEFT)
+    tk.Button(btn_row, text="Reload", command=reload_from_disk, width=10).pack(side=tk.LEFT, padx=10)
+    tk.Button(btn_row, text="Open Excel Folder", command=lambda: _open_folder(batch_file.parent), width=16).pack(side=tk.LEFT)
+
+    refresh_table_and_plot()
 
 def _get_scan_value():
     scan_script = BASE_DIR / "scan_program.py"
@@ -160,18 +345,32 @@ def _get_scan_value():
 
     return random.randint(1, 999)
 
+def _infer_batch_str_from_file(batch_file: Path) -> str:
+    """Infer batch label from file contents, filename, or fallback '?'."""
+    batch_str = None
+    try:
+        df = pd.read_excel(batch_file)
+        if not df.empty and "Batch" in df.columns and pd.notna(df.loc[0, "Batch"]):
+            batch_str = str(df.loc[0, "Batch"])
+    except Exception:
+        pass
+
+    if not batch_str:
+        parts = batch_file.stem.split("_")
+        if len(parts) >= 2 and parts[0].lower() == "batch":
+            batch_str = parts[1]
+
+    return batch_str or "?"
 
 class BatchSetupWindow:
     def __init__(self, root):
         self.root = root
         self.root.title("Batch Setup")
-        self.root.geometry("500x600")
+        self.root.geometry("650x600")
 
-        # Load saved batches folder (if any)
         settings = _load_settings()
         self.batches_dir = Path(settings["batches_dir"]) if settings.get("batches_dir") else None
 
-        # Load image
         photo = _safe_load_image(BASE_DIR / "oksir.png")
         if photo:
             img_label = tk.Label(root, image=photo, bg="lightgray")
@@ -180,7 +379,6 @@ class BatchSetupWindow:
             img_label = tk.Label(root, text="[Logo placeholder]", bg="lightgray", font=("Segoe UI", 14))
         img_label.pack(pady=(15, 5))
 
-        # Title under logo
         title_label = tk.Label(
             root,
             text="Exuvia Counting Program",
@@ -188,7 +386,6 @@ class BatchSetupWindow:
         )
         title_label.pack(pady=(0, 20))
 
-        # Buttons only (no batch entry on first UI)
         btn_frame = tk.Frame(root)
         btn_frame.pack(pady=20)
 
@@ -210,8 +407,16 @@ class BatchSetupWindow:
             width=16
         ).grid(row=0, column=1, padx=10)
 
+        tk.Button(
+            btn_frame,
+            text="COMPARE BATCHES",
+            command=self.compare_batches_flow,
+            bg="Grey", fg="white",
+            font=("Arial", 12),
+            width=16
+        ).grid(row=0, column=2, padx=10)
+
     def _ensure_batches_dir(self) -> bool:
-        """Ensure we have a batches folder. If not, prompt user to select one and save it."""
         if self.batches_dir and self.batches_dir.exists():
             return True
 
@@ -228,7 +433,6 @@ class BatchSetupWindow:
         return True
 
     def _ask_batch_number_dialog(self) -> str | None:
-        """Modal dialog to ask for batch number after clicking NEW BATCH."""
         dlg = tk.Toplevel(self.root)
         dlg.title("New Batch")
         dlg.geometry("320x140")
@@ -289,44 +493,43 @@ class BatchSetupWindow:
             return
 
         batch_file = Path(file_path)
-
-        # Infer batch from file contents, then filename, then "?"
-        batch_str = None
-        try:
-            df = pd.read_excel(batch_file)
-            if not df.empty and "Batch" in df.columns and pd.notna(df.loc[0, "Batch"]):
-                batch_str = str(df.loc[0, "Batch"])
-        except Exception:
-            pass
-
-        if not batch_str:
-            parts = batch_file.stem.split("_")
-            if len(parts) >= 2 and parts[0].lower() == "batch":
-                batch_str = parts[1]
-
-        if not batch_str:
-            batch_str = "?"
-
+        batch_str = _infer_batch_str_from_file(batch_file)
         open_scan_window(self.root, batch_file, batch_str)
 
+    def compare_batches_flow(self):
+        if not self._ensure_batches_dir():
+            messagebox.showwarning("Missing folder", "Please select a folder that contains batch files.", parent=self.root)
+            return
 
-def open_scan_window(parent, batch_file: Path, batch_str: str):
-    scan_root = tk.Toplevel(parent)
-    scan_root.title("Scanning")
-    scan_root.geometry("1100x700")
+        files = filedialog.askopenfilenames(
+            title="Select two or more batch Excel files to compare",
+            initialdir=str(self.batches_dir),
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+        )
+        if not files:
+            return
+        if len(files) < 2:
+            messagebox.showwarning("Select at least two", "Please select two or more batch files to compare.", parent=self.root)
+            return
 
-    # Keep focus sane / avoid main window jumping forward
-    scan_root.transient(parent)
-    scan_root.lift()
-    scan_root.focus_force()
+        batch_files = [Path(f) for f in files]
+        open_compare_window(self.root, batch_files)
 
-    # ---- Layout: left (video), right (data+plot) ----
-    outer = tk.Frame(scan_root)
+def open_compare_window(parent, batch_files: list[Path]):
+    win = tk.Toplevel(parent)
+    win.title("Compare Batches")
+    win.geometry("1250x780")
+
+    win.transient(parent)
+    win.lift()
+    win.focus_force()
+
+    # Layout: left = controls + averages + tabs; right = plot
+    outer = tk.Frame(win)
     outer.pack(fill=tk.BOTH, expand=True)
 
-    outer.columnconfigure(0, weight=3)  # LEFT = wider (video)
-    outer.columnconfigure(1, weight=2)  # RIGHT = narrower (data)
-
+    outer.columnconfigure(0, weight=2)
+    outer.columnconfigure(1, weight=3)
     outer.rowconfigure(0, weight=1)
 
     left = tk.Frame(outer)
@@ -335,87 +538,163 @@ def open_scan_window(parent, batch_file: Path, batch_str: str):
     right = tk.Frame(outer)
     right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-    # ---- Left: Video feed placeholder ----
-    video_label = tk.Label(
-        left,
-        text="[Live Video Feed Placeholder]",
-        bg="black",
-        fg="white",
-        height=15
-    )
-    video_label.pack(fill=tk.BOTH, expand=True)
+    # --- Selected list (top-left) ---
+    tk.Label(left, text="Selected Batches", font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
-    status_label = tk.Label(scan_root, text=f"Ready • File: {batch_file.name}", anchor="w")
-    status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+    listbox = tk.Listbox(left, height=5)
+    listbox.pack(fill=tk.X, pady=(5, 10))
 
-    # ---- Right: Excel data table (Treeview) ----
-    table_title = tk.Label(right, text="Batch Data (Excel)", font=("Segoe UI", 12, "bold"))
-    table_title.pack(anchor="w")
+    batch_labels: list[str] = []
+    for f in batch_files:
+        b = _infer_batch_str_from_file(f)
+        batch_labels.append(b)
+        listbox.insert(tk.END, f"{b}  •  {f.name}")
 
-    table_frame = tk.Frame(right)
-    table_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 10))
+    # --- Averages panel (left) ---
+    avg_frame = tk.LabelFrame(left, text="Averages", padx=8, pady=8)
+    avg_frame.pack(fill=tk.X, pady=(0, 10))
 
-    columns = ("Timestamp", "Batch", "Value")
-    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
-    widths = {"Timestamp": 220, "Batch": 120, "Value": 120}
-    for col in columns:
-        tree.heading(col, text=col)
-        tree.column(col, width=widths.get(col, 140), anchor="w")
+    avg_batch_label = tk.Label(avg_frame, text="Per-batch averages will appear here.", justify="left", anchor="w")
+    avg_batch_label.pack(fill=tk.X)
 
-    vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=vsb.set)
+    avg_combined_label = tk.Label(avg_frame, text="Combined average: —", justify="left", anchor="w")
+    avg_combined_label.pack(fill=tk.X, pady=(6, 0))
 
-    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    # --- Tabs for per-batch tables (left bottom) ---
+    tk.Label(left, text="Data (per batch)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
-    # ---- Right: Matplotlib line plot ----
-    plot_title = tk.Label(right, text="Scan Values (Line Graph)", font=("Segoe UI", 12, "bold"))
-    plot_title.pack(anchor="w", pady=(0, 5))
+    notebook = ttk.Notebook(left)
+    notebook.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-    fig = Figure(figsize=(5.2, 3.2), dpi=100)
+    # For each batch file, create a tab containing its own table
+    tab_tables: dict[Path, ttk.Treeview] = {}
+
+    def _make_table(parent_frame):
+        cols = ("Timestamp", "Batch", "Value")
+        table_frame = tk.Frame(parent_frame)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+
+        tree = ttk.Treeview(table_frame, columns=cols, show="headings")
+        tree.heading("Timestamp", text="Timestamp")
+        tree.heading("Batch", text="Batch")
+        tree.heading("Value", text="Value")
+
+        tree.column("Timestamp", width=210, anchor="w")
+        tree.column("Batch", width=90, anchor="w")
+        tree.column("Value", width=90, anchor="w")
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        return tree
+
+    for f in batch_files:
+        b = _infer_batch_str_from_file(f)
+        tab = tk.Frame(notebook)
+        notebook.add(tab, text=b)  # tab title = batch label
+        tab_tables[f] = _make_table(tab)
+
+    # --- Right: plot ---
+    tk.Label(right, text="Comparison Plot", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
+    fig = Figure(figsize=(6.8, 5.8), dpi=100)
     ax = fig.add_subplot(111)
     ax.set_xlabel("Scan #")
     ax.set_ylabel("Value")
 
     canvas = FigureCanvasTkAgg(fig, master=right)
-    canvas_widget = canvas.get_tk_widget()
-    canvas_widget.pack(fill=tk.BOTH, expand=False)
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-    def refresh_table_and_plot():
-        df = _read_excel_df(batch_file)
-
-        # Table
-        for item in tree.get_children():
-            tree.delete(item)
-
-        for _, row in df.iterrows():
-            tree.insert("", tk.END, values=(
-                row.get("Timestamp", ""),
-                row.get("Batch", ""),
-                row.get("Value", "")
-            ))
-
-        children = tree.get_children()
-        if children:
-            tree.see(children[-1])
-
-        # Plot
-        vals = pd.to_numeric(df["Value"], errors="coerce").dropna().tolist()
-
+    def load_all():
+        # Clear plot
         ax.clear()
         ax.set_xlabel("Scan #")
         ax.set_ylabel("Value")
 
-        if vals:
-            x = list(range(1, len(vals) + 1))
-            ax.plot(x, vals, marker="o")
-            ax.set_xlim(1, max(2, len(vals)))
+        # Clear every tab table
+        for _, tree in tab_tables.items():
+            for item in tree.get_children():
+                tree.delete(item)
+
+        any_series = False
+        pooled_vals: list[float] = []
+        avg_map: dict[str, float] = {}
+
+        # Load each batch
+        for f in batch_files:
+            df = _read_excel_df(f).copy()
+            batch_label = _infer_batch_str_from_file(f)
+
+            # Fill this batch's table (tab)
+            tree = tab_tables[f]
+            for _, r in df.iterrows():
+                tree.insert("", tk.END, values=(
+                    r.get("Timestamp", ""),
+                    r.get("Batch", ""),
+                    r.get("Value", "")
+                ))
+
+            # Auto-scroll table to bottom
+            children = tree.get_children()
+            if children:
+                tree.see(children[-1])
+
+            # Numeric values for plot + averages
+            vals = pd.to_numeric(df["Value"], errors="coerce").dropna().tolist()
+
+            if vals:
+                pooled_vals.extend(vals)
+                avg_map[batch_label] = float(sum(vals) / len(vals))
+
+                x = list(range(1, len(vals) + 1))
+                ax.plot(x, vals, marker="o", label=batch_label)
+                any_series = True
+
+        # Update averages text
+        lines = []
+        for f in batch_files:
+            b = _infer_batch_str_from_file(f)
+            if b in avg_map:
+                lines.append(f"{b}: {avg_map[b]:.3f}")
+            else:
+                lines.append(f"{b}: —")
+        avg_batch_label.config(text="\n".join(lines))
+
+        if pooled_vals:
+            combined_avg = float(sum(pooled_vals) / len(pooled_vals))
+            avg_combined_label.config(text=f"Combined average (all batches): {combined_avg:.3f}")
         else:
-            ax.text(0.5, 0.5, "No numeric scan values yet", ha="center", va="center", transform=ax.transAxes)
+            avg_combined_label.config(text="Combined average (all batches): —")
+
+        # Plot formatting
+        if any_series:
+            ax.legend()
+        else:
+            ax.text(
+                0.5, 0.5,
+                "No numeric scan values found in selected files",
+                ha="center", va="center", transform=ax.transAxes
+            )
 
         ax.grid(True, linewidth=0.5, alpha=0.4)
         fig.tight_layout()
         canvas.draw()
+
+    # Buttons (right bottom)
+    btn_row = tk.Frame(right)
+    btn_row.pack(fill=tk.X, pady=(10, 0))
+
+    tk.Button(btn_row, text="Refresh", command=load_all, width=10).pack(side=tk.LEFT)
+    tk.Button(
+        btn_row,
+        text="Open Folder",
+        command=lambda: _open_folder(batch_files[0].parent),
+        width=12
+    ).pack(side=tk.LEFT, padx=10)
+
+    load_all()
 
     def do_scan():
         status_label.config(text="Scanning...")
@@ -427,11 +706,9 @@ def open_scan_window(parent, batch_file: Path, batch_str: str):
         )
         refresh_table_and_plot()
 
-        # keep scan window in front
         scan_root.lift()
         scan_root.focus_force()
 
-    # Buttons row
     btn_row = tk.Frame(left)
     btn_row.pack(fill=tk.X, pady=(10, 0))
 
@@ -460,7 +737,6 @@ def open_scan_window(parent, batch_file: Path, batch_str: str):
     ).pack(side=tk.LEFT)
 
     refresh_table_and_plot()
-
 
 if __name__ == "__main__":
     root = tk.Tk()

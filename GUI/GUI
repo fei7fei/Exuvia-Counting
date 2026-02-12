@@ -16,13 +16,12 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
 
 # -------------------------
-# Helpers (yours, unchanged)
+# Helpers
 # -------------------------
 def _safe_load_image(path, size=(300, 300)):
     try:
@@ -52,6 +51,7 @@ def _save_settings(settings: dict):
 
 
 def _open_folder(path: Path):
+    """Open a folder in the OS file explorer."""
     try:
         path = path.resolve()
         if platform.system() == "Windows":
@@ -65,6 +65,10 @@ def _open_folder(path: Path):
 
 
 def _create_or_get_excel(path: Path, batch_str: str):
+    """
+    Creates a new Excel file if it doesn't exist using the schema:
+    Timestamp | Batch | Value
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return path
@@ -76,6 +80,12 @@ def _create_or_get_excel(path: Path, batch_str: str):
 
 
 def _read_excel_df(path: Path) -> pd.DataFrame:
+    """
+    Reads an Excel file and normalizes it to the expected schema:
+    Timestamp | Batch | Value
+
+    Also supports older schemas gracefully.
+    """
     expected = ["Timestamp", "Batch", "Value"]
     try:
         df = pd.read_excel(path)
@@ -109,6 +119,9 @@ def _append_to_excel(path: Path, batch_str: str, value):
 
 
 def _get_scan_value():
+    """
+    Runs scan_program.py or scan_program.exe if present; otherwise returns random.
+    """
     scan_script = BASE_DIR / "scan_program.py"
     if scan_script.exists():
         try:
@@ -153,6 +166,7 @@ def _get_scan_value():
 
 
 def _infer_batch_str_from_file(batch_file: Path) -> str:
+    """Infer batch label from file contents, filename, or fallback '?'."""
     batch_str = None
     try:
         df = pd.read_excel(batch_file)
@@ -170,7 +184,109 @@ def _infer_batch_str_from_file(batch_file: Path) -> str:
 
 
 # -------------------------
-# App Router (single Tk root)
+# Live Feed Widget (local Pi camera)
+# -------------------------
+class PiCameraLiveFeed(tk.Frame):
+    def __init__(self, parent, size=(960, 540), fps=20):
+        super().__init__(parent)
+        self.size = size
+        self.delay_ms = max(1, int(1000 / max(1, fps)))
+
+        self.label = tk.Label(
+            self,
+            bg="black",
+            fg="white",
+            text="No camera selected.\nChoose a camera and click Connect.",
+            justify="center"
+        )
+        self.label.pack(fill=tk.BOTH, expand=True)
+
+        self.picam2 = None
+        self._job = None
+        self._running = False
+        self._imgtk = None  # keep reference
+
+    def connect(self, camera_index: int = 0) -> bool:
+        """Initialize + start the camera. Returns True if connected."""
+        self.disconnect()  # reset state first
+
+        try:
+            # Import lazily so the app still runs even if picamera2 isn't available
+            from picamera2 import Picamera2
+
+            self.picam2 = Picamera2(camera_index=camera_index)
+
+            config = self.picam2.create_preview_configuration(
+                main={"size": self.size, "format": "RGB888"}
+            )
+            self.picam2.configure(config)
+            self.picam2.start()
+
+            self._running = True
+            self.label.config(text="", image="")
+            self._tick()
+            return True
+
+        except Exception as e:
+            self.picam2 = None
+            self._running = False
+            self.label.config(
+                image="",
+                text=f"Camera not available.\n\n{e}\n\nSelect a camera and try again.",
+                justify="center"
+            )
+            return False
+
+    def disconnect(self):
+        """Stop preview loop and close camera safely."""
+        self._running = False
+
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+        if self.picam2 is not None:
+            try:
+                self.picam2.stop()
+            except Exception:
+                pass
+            try:
+                self.picam2.close()
+            except Exception:
+                pass
+            self.picam2 = None
+
+        self._imgtk = None
+        self.label.config(
+            image="",
+            text="No camera selected.\nChoose a camera and click Connect.",
+            justify="center"
+        )
+
+    def _tick(self):
+        if not self._running or self.picam2 is None:
+            return
+
+        try:
+            frame = self.picam2.capture_array()  # RGB numpy array
+            img = Image.fromarray(frame)
+            self._imgtk = ImageTk.PhotoImage(img)
+            self.label.config(image=self._imgtk, text="")
+        except Exception as e:
+            # If capture fails mid-stream, show message but keep UI alive
+            self._running = False
+            self.label.config(image="", text=f"Camera error:\n{e}", justify="center")
+            return
+
+        self._job = self.after(self.delay_ms, self._tick)
+
+
+
+# -------------------------
+# Single-window Router App
 # -------------------------
 class App(tk.Tk):
     def __init__(self):
@@ -182,18 +298,21 @@ class App(tk.Tk):
         batches_dir = Path(settings["batches_dir"]) if settings.get("batches_dir") else None
 
         self.state = {
-            "batches_dir": batches_dir,          # Path | None
-            "scan_batch_file": None,             # Path | None
-            "scan_batch_str": None,              # str | None
-            "compare_files": [],                 # list[Path]
+            "batches_dir": batches_dir,      # Path | None
+            "scan_batch_file": None,         # Path | None
+            "scan_batch_str": None,          # str | None
+            "compare_files": [],             # list[Path]
         }
+
+        self.current_page: str | None = None
 
         container = tk.Frame(self)
         container.pack(fill=tk.BOTH, expand=True)
         container.rowconfigure(0, weight=1)
         container.columnconfigure(0, weight=1)
 
-        self.pages = {}
+        self.pages: dict[str, tk.Frame] = {}
+
         for PageCls in (HomePage, ScanPage, ComparePage):
             page = PageCls(container, self)
             self.pages[PageCls.__name__] = page
@@ -202,10 +321,18 @@ class App(tk.Tk):
         self.show("HomePage")
 
     def show(self, page_name: str):
+        # hide previous
+        if self.current_page:
+            old = self.pages[self.current_page]
+            if hasattr(old, "on_hide"):
+                old.on_hide()
+
+        # show new
         page = self.pages[page_name]
         if hasattr(page, "on_show"):
             page.on_show()
         page.tkraise()
+        self.current_page = page_name
 
     def ensure_batches_dir(self, parent_widget=None) -> bool:
         bd = self.state.get("batches_dir")
@@ -247,17 +374,20 @@ class HomePage(tk.Frame):
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=20)
 
-        tk.Button(btn_frame, text="NEW BATCH", width=16,
-                  command=self.new_batch_flow, bg="Grey", fg="white", font=("Arial", 12)
-                  ).grid(row=0, column=0, padx=10)
+        tk.Button(
+            btn_frame, text="NEW BATCH", command=self.new_batch_flow,
+            bg="Grey", fg="white", font=("Arial", 12), width=16
+        ).grid(row=0, column=0, padx=10)
 
-        tk.Button(btn_frame, text="EXISTING BATCH", width=16,
-                  command=self.select_existing_batch, bg="Grey", fg="white", font=("Arial", 12)
-                  ).grid(row=0, column=1, padx=10)
+        tk.Button(
+            btn_frame, text="EXISTING BATCH", command=self.select_existing_batch,
+            bg="Grey", fg="white", font=("Arial", 12), width=16
+        ).grid(row=0, column=1, padx=10)
 
-        tk.Button(btn_frame, text="COMPARE", width=16,
-                  command=self.compare_batches_flow, bg="Grey", fg="white", font=("Arial", 12)
-                  ).grid(row=0, column=2, padx=10)
+        tk.Button(
+            btn_frame, text="COMPARE", command=self.compare_batches_flow,
+            bg="Grey", fg="white", font=("Arial", 12), width=16
+        ).grid(row=0, column=2, padx=10)
 
     def _ask_batch_number_dialog(self) -> str | None:
         dlg = tk.Toplevel(self)
@@ -281,7 +411,14 @@ class HomePage(tk.Frame):
             result["val"] = val
             dlg.destroy()
 
-        tk.Button(dlg, text="OK", command=ok, width=10).pack(pady=10)
+        def cancel():
+            dlg.destroy()
+
+        btns = tk.Frame(dlg)
+        btns.pack(pady=10)
+        tk.Button(btns, text="Cancel", command=cancel, width=10).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btns, text="OK", command=ok, width=10).pack(side=tk.RIGHT, padx=5)
+
         dlg.wait_window()
         return result["val"]
 
@@ -295,7 +432,9 @@ class HomePage(tk.Frame):
             return
 
         bd: Path = self.controller.state["batches_dir"]
-        file_path = bd / f"batch_{batch_val}.xlsx"
+        fname = f"batch_{batch_val}.xlsx"
+        file_path = bd / fname
+
         _create_or_get_excel(file_path, batch_val)
 
         self.controller.state["scan_batch_file"] = file_path
@@ -344,25 +483,29 @@ class HomePage(tk.Frame):
 
 
 # -------------------------
-# Page 2: Scan (former open_scan_window)
+# Page 2: Scan
 # -------------------------
 class ScanPage(tk.Frame):
     def __init__(self, parent, controller: App):
         super().__init__(parent)
         self.controller = controller
 
+        # state
+        self.batch_file: Path | None = None
+        self.batch_str: str | None = None
+        self.df_cache = pd.DataFrame(columns=["Timestamp", "Batch", "Value"])
+        self.dirty = False
+
         # Top bar
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=10, pady=10)
 
         tk.Button(top, text="← Back", command=lambda: controller.show("HomePage")).pack(side=tk.LEFT)
-        self.header = tk.Label(top, text="Scanning", font=("Segoe UI", 14, "bold"))
-        self.header.pack(side=tk.LEFT, padx=10)
+        tk.Label(top, text="Scanning", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=10)
 
         self.status_label = tk.Label(self, text="Ready", anchor="w")
         self.status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-        # Layout
         outer = tk.Frame(self)
         outer.pack(fill=tk.BOTH, expand=True)
 
@@ -370,18 +513,42 @@ class ScanPage(tk.Frame):
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(0, weight=1)
 
-        self.left = tk.Frame(outer)
-        self.left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        left = tk.Frame(outer)
+        left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
 
-        self.right = tk.Frame(outer)
-        self.right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        right = tk.Frame(outer)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-        self.video_label = tk.Label(self.left, text="[Live Video Feed Placeholder]", bg="black", fg="white")
-        self.video_label.pack(fill=tk.BOTH, expand=True)
+        # =========================
+        # Camera controls (NEW)
+        # =========================
+        cam_bar = tk.Frame(left)
+        cam_bar.pack(fill=tk.X, pady=(0, 8))
 
-        # Table
-        tk.Label(self.right, text="Batch Data", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        table_frame = tk.Frame(self.right)
+        tk.Label(cam_bar, text="Camera:").pack(side=tk.LEFT)
+
+        self.cam_var = tk.StringVar(value="(none)")
+        self.cam_combo = ttk.Combobox(
+            cam_bar,
+            textvariable=self.cam_var,
+            state="readonly",
+            width=28,
+            values=["(none)"]
+        )
+        self.cam_combo.pack(side=tk.LEFT, padx=6)
+
+        tk.Button(cam_bar, text="Rescan", command=self.refresh_camera_list).pack(side=tk.LEFT, padx=4)
+        tk.Button(cam_bar, text="Connect", command=self.connect_camera).pack(side=tk.LEFT, padx=4)
+        tk.Button(cam_bar, text="Disconnect", command=self.disconnect_camera).pack(side=tk.LEFT, padx=4)
+
+        # Live feed (Pi camera) — now NOT auto-started
+        self.live = PiCameraLiveFeed(left, size=(960, 540), fps=20)
+        self.live.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Table ----
+        tk.Label(right, text="Batch Data", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
+        table_frame = tk.Frame(right)
         table_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 10))
 
         columns = ("Row", "Timestamp", "Batch", "Value")
@@ -397,19 +564,19 @@ class ScanPage(tk.Frame):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Plot
-        tk.Label(self.right, text="Scan Values", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
+        # ---- Plot ----
+        tk.Label(right, text="Scan Values", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
 
         self.fig = Figure(figsize=(5.2, 3.5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("Scan #")
         self.ax.set_ylabel("Value")
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=False)
 
-        # Buttons
-        btn_row = tk.Frame(self.left)
+        # ---- Buttons ----
+        btn_row = tk.Frame(left)
         btn_row.pack(fill=tk.X, pady=(10, 0))
 
         tk.Button(btn_row, text="SCAN", command=self.do_scan, bg="green", fg="white",
@@ -417,15 +584,68 @@ class ScanPage(tk.Frame):
         tk.Button(btn_row, text="DELETE SELECTED", command=self.delete_selected, width=16).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_row, text="SAVE", command=self.save_changes, width=10).pack(side=tk.LEFT)
         tk.Button(btn_row, text="Reload", command=self.reload_from_disk, width=10).pack(side=tk.LEFT, padx=10)
-        tk.Button(btn_row, text="Open Excel Folder",
-                  command=self.open_excel_folder, width=16).pack(side=tk.LEFT)
+        tk.Button(btn_row, text="Open Excel Folder", command=self.open_excel_folder, width=16).pack(side=tk.LEFT)
 
-        # page state
-        self.batch_file: Path | None = None
-        self.batch_str: str | None = None
-        self.df_cache = pd.DataFrame(columns=["Timestamp", "Batch", "Value"])
-        self.dirty = False
+    # =========================
+    # Camera selection logic (NEW)
+    # =========================
+    def refresh_camera_list(self):
+        """
+        Populate dropdown with available cameras.
+        If libcamera/picamera2 isn't available or no cameras found, show (none).
+        """
+        cams = []
+        try:
+            from picamera2 import Picamera2
+            infos = Picamera2.global_camera_info()  # list of dicts
+            for i, info in enumerate(infos):
+                # These keys vary; try a few
+                name = info.get("Model") or info.get("Name") or info.get("Id") or f"Camera {i}"
+                cams.append((i, str(name)))
+        except Exception:
+            cams = []
 
+        if not cams:
+            self.cam_combo["values"] = ["(none)"]
+            self.cam_var.set("(none)")
+            return
+
+        pretty = [f"{i}: {name}" for i, name in cams]
+        self.cam_combo["values"] = pretty
+
+        # Keep selection if still valid, else choose first
+        cur = self.cam_var.get()
+        if cur not in pretty:
+            self.cam_var.set(pretty[0])
+
+    def _selected_camera_index(self) -> int | None:
+        v = (self.cam_var.get() or "").strip()
+        if not v or v == "(none)":
+            return None
+        try:
+            return int(v.split(":", 1)[0].strip())
+        except Exception:
+            return None
+
+    def connect_camera(self):
+        idx = self._selected_camera_index()
+        if idx is None:
+            messagebox.showwarning("No camera", "No camera selected.", parent=self)
+            return
+
+        ok = self.live.connect(camera_index=idx)
+        if ok:
+            self._set_status("Camera connected.")
+        else:
+            self._set_status("Camera not available.")
+
+    def disconnect_camera(self):
+        self.live.disconnect()
+        self._set_status("Camera disconnected.")
+
+    # =========================
+    # Navigation hooks (UPDATED)
+    # =========================
     def on_show(self):
         self.batch_file = self.controller.state.get("scan_batch_file")
         self.batch_str = self.controller.state.get("scan_batch_str")
@@ -437,8 +657,19 @@ class ScanPage(tk.Frame):
         self.df_cache = _read_excel_df(self.batch_file)
         self.dirty = False
         self.status_label.config(text=f"Ready • File: {self.batch_file.name}")
+
+        # IMPORTANT: do NOT auto-connect the camera
+        self.refresh_camera_list()
+
         self.refresh_table_and_plot()
 
+    def on_hide(self):
+        # Stop camera when leaving the page (safe even if not connected)
+        self.live.disconnect()
+
+    # =========================
+    # Your existing scan/table/plot logic (same as before)
+    # =========================
     def _set_status(self, msg: str):
         suffix = " • Unsaved changes" if self.dirty else ""
         self.status_label.config(text=msg + suffix)
@@ -456,18 +687,21 @@ class ScanPage(tk.Frame):
             return False
 
     def refresh_table_and_plot(self):
-        # Table
         for item in self.tree.get_children():
             self.tree.delete(item)
 
         for i, row in self.df_cache.iterrows():
-            self.tree.insert("", tk.END, values=(i + 1, row.get("Timestamp", ""), row.get("Batch", ""), row.get("Value", "")))
+            self.tree.insert("", tk.END, values=(
+                i + 1,
+                row.get("Timestamp", ""),
+                row.get("Batch", ""),
+                row.get("Value", "")
+            ))
 
         children = self.tree.get_children()
         if children:
             self.tree.see(children[-1])
 
-        # Plot
         vals = pd.to_numeric(self.df_cache["Value"], errors="coerce").dropna().tolist()
 
         self.ax.clear()
@@ -479,7 +713,8 @@ class ScanPage(tk.Frame):
             self.ax.plot(x, vals, marker="o")
             self.ax.set_xlim(1, max(2, len(vals)))
         else:
-            self.ax.text(0.5, 0.5, "No numeric scan values yet", ha="center", va="center", transform=self.ax.transAxes)
+            self.ax.text(0.5, 0.5, "No numeric scan values yet", ha="center", va="center",
+                         transform=self.ax.transAxes)
 
         self.ax.grid(True, linewidth=0.5, alpha=0.4)
         self.fig.tight_layout()
@@ -491,8 +726,8 @@ class ScanPage(tk.Frame):
             return
 
         self._set_status("Scanning...")
-        scan_val = _get_scan_value()
 
+        scan_val = _get_scan_value()
         self.df_cache.loc[len(self.df_cache)] = [
             datetime.now().isoformat(sep=" ", timespec="seconds"),
             self.batch_str,
@@ -501,7 +736,9 @@ class ScanPage(tk.Frame):
 
         ok = self._write_df_to_excel()
         if ok:
-            self.status_label.config(text=f"Last scan: {scan_val} at {datetime.now().strftime('%H:%M:%S')} • Saved • File: {self.batch_file.name}")
+            self.status_label.config(
+                text=f"Last scan: {scan_val} at {datetime.now().strftime('%H:%M:%S')} • Saved • File: {self.batch_file.name}"
+            )
 
         self.refresh_table_and_plot()
 
@@ -556,14 +793,18 @@ class ScanPage(tk.Frame):
             return
         _open_folder(self.batch_file.parent)
 
+# -------------------------
+# Page 3: Compare
+# -------------------------
 
-# -------------------------
-# Page 3: Compare (former open_compare_window)
-# -------------------------
 class ComparePage(tk.Frame):
     def __init__(self, parent, controller: App):
         super().__init__(parent)
         self.controller = controller
+
+        # runtime structures
+        self.batch_files: list[Path] = []
+        self.tab_tables: dict[Path, ttk.Treeview] = {}
 
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=10, pady=10)
@@ -578,47 +819,50 @@ class ComparePage(tk.Frame):
         outer.columnconfigure(1, weight=3)
         outer.rowconfigure(0, weight=1)
 
-        self.left = tk.Frame(outer)
-        self.left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        left = tk.Frame(outer)
+        left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
 
-        self.right = tk.Frame(outer)
-        self.right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        right = tk.Frame(outer)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-        tk.Label(self.left, text="Selected Batches", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        self.listbox = tk.Listbox(self.left, height=5)
+        # Selected list
+        tk.Label(left, text="Selected Batches", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        self.listbox = tk.Listbox(left, height=5)
         self.listbox.pack(fill=tk.X, pady=(5, 10))
 
-        self.avg_frame = tk.LabelFrame(self.left, text="Averages", padx=8, pady=8)
-        self.avg_frame.pack(fill=tk.X, pady=(0, 10))
+        # Averages
+        avg_frame = tk.LabelFrame(left, text="Averages", padx=8, pady=8)
+        avg_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.avg_batch_label = tk.Label(self.avg_frame, text="Per-batch averages will appear here.", justify="left", anchor="w")
+        self.avg_batch_label = tk.Label(avg_frame, text="Per-batch averages will appear here.",
+                                        justify="left", anchor="w")
         self.avg_batch_label.pack(fill=tk.X)
 
-        self.avg_combined_label = tk.Label(self.avg_frame, text="Combined average: —", justify="left", anchor="w")
+        self.avg_combined_label = tk.Label(avg_frame, text="Combined average: —",
+                                           justify="left", anchor="w")
         self.avg_combined_label.pack(fill=tk.X, pady=(6, 0))
 
-        tk.Label(self.left, text="Data (per batch)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        self.notebook = ttk.Notebook(self.left)
+        # Tabs for tables
+        tk.Label(left, text="Data (per batch)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        self.notebook = ttk.Notebook(left)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        tk.Label(self.right, text="Comparison Plot", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        # Plot
+        tk.Label(right, text="Comparison Plot", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
         self.fig = Figure(figsize=(6.8, 5.8), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("Scan #")
         self.ax.set_ylabel("Value")
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        btn_row = tk.Frame(self.right)
+        btn_row = tk.Frame(right)
         btn_row.pack(fill=tk.X, pady=(10, 0))
 
         tk.Button(btn_row, text="Refresh", command=self.load_all, width=10).pack(side=tk.LEFT)
         tk.Button(btn_row, text="Open Folder", command=self.open_folder, width=12).pack(side=tk.LEFT, padx=10)
-
-        # runtime structures
-        self.batch_files: list[Path] = []
-        self.tab_tables: dict[Path, ttk.Treeview] = {}
 
     def on_show(self):
         self.batch_files = self.controller.state.get("compare_files", []) or []
@@ -684,11 +928,15 @@ class ComparePage(tk.Frame):
             df = _read_excel_df(f).copy()
             batch_label = _infer_batch_str_from_file(f)
 
-            # Fill tab table
+            # fill tab table
             tree = self.tab_tables.get(f)
             if tree:
                 for _, r in df.iterrows():
-                    tree.insert("", tk.END, values=(r.get("Timestamp", ""), r.get("Batch", ""), r.get("Value", "")))
+                    tree.insert("", tk.END, values=(
+                        r.get("Timestamp", ""),
+                        r.get("Batch", ""),
+                        r.get("Value", "")
+                    ))
                 children = tree.get_children()
                 if children:
                     tree.see(children[-1])
@@ -702,14 +950,11 @@ class ComparePage(tk.Frame):
                 self.ax.plot(x, vals, marker="o", label=batch_label)
                 any_series = True
 
-        # Averages
+        # averages text
         lines = []
         for f in self.batch_files:
             b = _infer_batch_str_from_file(f)
-            if b in avg_map:
-                lines.append(f"{b}: {avg_map[b]:.3f}")
-            else:
-                lines.append(f"{b}: —")
+            lines.append(f"{b}: {avg_map[b]:.3f}" if b in avg_map else f"{b}: —")
         self.avg_batch_label.config(text="\n".join(lines))
 
         if pooled_vals:
@@ -733,10 +978,18 @@ class ComparePage(tk.Frame):
             return
         _open_folder(self.batch_files[0].parent)
 
-
-# -------------------------
-# Run
-# -------------------------
 if __name__ == "__main__":
     app = App()
+
+    def _on_close():
+        try:
+            if app.current_page == "ScanPage":
+                page = app.pages["ScanPage"]
+                if hasattr(page, "on_hide"):
+                    page.on_hide()
+        except Exception:
+            pass
+        app.destroy()
+
+    app.protocol("WM_DELETE_WINDOW", _on_close)
     app.mainloop()

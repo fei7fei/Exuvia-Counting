@@ -9,6 +9,7 @@ from datetime import datetime
 PICAMERA2_AVAILABLE = False
 try:
     from picamera2 import Picamera2
+    from picamera2.global_camera_info import global_camera_info
     PICAMERA2_AVAILABLE = True
 except ImportError:
     PICAMERA2_AVAILABLE = False
@@ -28,7 +29,7 @@ class CameraApp:
     def __init__(self, root):
         self.root = root
         self.root.title(WINDOW_TITLE)
-        self.root.geometry("900x760")
+        self.root.geometry("920x760")
         self.root.resizable(False, False)
 
         self.cap = None
@@ -66,7 +67,7 @@ class CameraApp:
             top_frame,
             textvariable=self.camera_var,
             state="readonly",
-            width=30
+            width=35
         )
         self.camera_dropdown.pack(side=tk.LEFT, padx=5)
 
@@ -88,18 +89,18 @@ class CameraApp:
         )
         refresh_button.pack(side=tk.LEFT, padx=5)
 
-        preview_frame = tk.Frame(self.root, bd=2, relief=tk.GROOVE)
+        preview_frame = tk.Frame(self.root, bd=2, relief=tk.GROOVE, bg="black")
         preview_frame.pack(pady=15)
 
         self.preview_label = tk.Label(
             preview_frame,
             text="No camera preview",
             bg="black",
-            fg="white",
-            width=PREVIEW_WIDTH,
-            height=PREVIEW_HEIGHT
+            fg="white"
         )
         self.preview_label.pack()
+        self.preview_label.config(width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT)
+        self.preview_label.pack_propagate(False)
 
         button_frame = tk.Frame(self.root)
         button_frame.pack(pady=12)
@@ -140,7 +141,9 @@ class CameraApp:
             self.root,
             textvariable=self.status_var,
             font=("Arial", 10),
-            fg="blue"
+            fg="blue",
+            wraplength=860,
+            justify="center"
         )
         self.status_label.pack(pady=10)
 
@@ -167,20 +170,24 @@ class CameraApp:
     def detect_cameras(self):
         cameras = []
 
+        # Detect Raspberry Pi cameras through Picamera2
         if PICAMERA2_AVAILABLE:
             try:
-                test_picam = Picamera2()
-                test_picam.close()
-                cameras.append({
-                    "type": "pi",
-                    "index": None,
-                    "label": "Raspberry Pi Camera"
-                })
+                cam_info = global_camera_info()
+                if cam_info:
+                    for idx, info in enumerate(cam_info):
+                        model = info.get("Model", f"Pi Camera {idx}")
+                        cameras.append({
+                            "type": "pi",
+                            "index": idx,
+                            "label": f"Raspberry Pi Camera {idx}: {model}"
+                        })
             except Exception:
                 pass
 
-        for i in range(5):
-            cap = cv2.VideoCapture(i)
+        # Detect USB cameras
+        for i in range(6):
+            cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
             if cap.isOpened():
                 ret, _ = cap.read()
                 if ret:
@@ -205,7 +212,9 @@ class CameraApp:
             self.status_var.set("Cameras detected. Select one and click Connect.")
         else:
             self.camera_var.set("")
-            self.status_var.set("No cameras found.")
+            self.status_var.set(
+                "No cameras found. Check ribbon cable / USB connection, then try Refresh Cameras."
+            )
             self.preview_label.config(image="", text="No camera preview", bg="black")
 
     def get_selected_camera(self):
@@ -232,17 +241,19 @@ class CameraApp:
 
         try:
             if selected["type"] == "pi":
-                self.picam2 = Picamera2()
+                self.picam2 = Picamera2(selected["index"])
                 config = self.picam2.create_preview_configuration(
-                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT)}
+                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
                 )
                 self.picam2.configure(config)
                 self.picam2.start()
+
                 self.current_camera_type = "pi"
-                self.current_camera_index = None
+                self.current_camera_index = selected["index"]
 
             elif selected["type"] == "usb":
-                self.cap = cv2.VideoCapture(selected["index"])
+                self.cap = cv2.VideoCapture(selected["index"], cv2.CAP_V4L2)
+
                 if not self.cap.isOpened():
                     raise RuntimeError(f"Could not open USB Camera {selected['index']}")
 
@@ -259,6 +270,7 @@ class CameraApp:
         except Exception as e:
             self.status_var.set("Failed to connect to camera.")
             messagebox.showerror("Camera Error", str(e))
+            self.stop_camera()
 
     def update_preview(self):
         if not self.preview_running:
@@ -274,22 +286,22 @@ class CameraApp:
 
             elif self.current_camera_type == "pi" and self.picam2 is not None:
                 frame = self.picam2.capture_array()
-                if frame is not None:
-                    if len(frame.shape) == 3 and frame.shape[2] == 4:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-                    elif len(frame.shape) == 3 and frame.shape[2] == 3:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                if frame is not None and len(frame.shape) == 3 and frame.shape[2] == 3:
+                    # Picamera2 RGB -> OpenCV BGR
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             if frame is not None:
                 self.last_frame_bgr = frame.copy()
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(rgb_frame)
-                img = img.resize((PREVIEW_WIDTH, PREVIEW_HEIGHT))
                 imgtk = ImageTk.PhotoImage(image=img)
 
                 self.preview_label.imgtk = imgtk
                 self.preview_label.configure(image=imgtk, text="")
+
+            else:
+                self.status_var.set("No frame received from camera.")
 
         except Exception as e:
             self.status_var.set(f"Preview error: {e}")
@@ -327,7 +339,10 @@ class CameraApp:
             self.preview_job = None
 
         if self.cap is not None:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception:
+                pass
             self.cap = None
 
         if self.picam2 is not None:

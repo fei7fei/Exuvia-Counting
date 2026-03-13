@@ -184,7 +184,7 @@ def _infer_batch_str_from_file(batch_file: Path) -> str:
 
 
 # -------------------------
-# Live Feed Widget (local Pi camera)
+# Live Feed Widget (Pi camera only)
 # -------------------------
 class PiCameraLiveFeed(tk.Frame):
     def __init__(self, parent, size=(960, 540), fps=20):
@@ -208,13 +208,13 @@ class PiCameraLiveFeed(tk.Frame):
 
     def connect(self, camera_index: int = 0) -> bool:
         """Initialize + start the camera. Returns True if connected."""
-        self.disconnect()  # reset state first
+        self.disconnect()
 
         try:
-            # Import lazily so the app still runs even if picamera2 isn't available
             from picamera2 import Picamera2
 
-            self.picam2 = Picamera2(camera_index=camera_index)
+            # Important: positional index works on your Pi, keyword form caused problems
+            self.picam2 = Picamera2(camera_index)
 
             config = self.picam2.create_preview_configuration(
                 main={"size": self.size, "format": "RGB888"}
@@ -222,9 +222,8 @@ class PiCameraLiveFeed(tk.Frame):
             self.picam2.configure(config)
             self.picam2.start()
 
-            self._running = True
-            self.label.config(text="", image="")
-            self._tick()
+            # slight warmup before starting preview loop
+            self.after(300, self._start_stream)
             return True
 
         except Exception as e:
@@ -236,6 +235,13 @@ class PiCameraLiveFeed(tk.Frame):
                 justify="center"
             )
             return False
+
+    def _start_stream(self):
+        if self.picam2 is None:
+            return
+        self._running = True
+        self.label.config(text="", image="")
+        self._tick()
 
     def disconnect(self):
         """Stop preview loop and close camera safely."""
@@ -276,13 +282,11 @@ class PiCameraLiveFeed(tk.Frame):
             self._imgtk = ImageTk.PhotoImage(img)
             self.label.config(image=self._imgtk, text="")
         except Exception as e:
-            # If capture fails mid-stream, show message but keep UI alive
             self._running = False
             self.label.config(image="", text=f"Camera error:\n{e}", justify="center")
             return
 
         self._job = self.after(self.delay_ms, self._tick)
-
 
 
 # -------------------------
@@ -321,13 +325,11 @@ class App(tk.Tk):
         self.show("HomePage")
 
     def show(self, page_name: str):
-        # hide previous
         if self.current_page:
             old = self.pages[self.current_page]
             if hasattr(old, "on_hide"):
                 old.on_hide()
 
-        # show new
         page = self.pages[page_name]
         if hasattr(page, "on_show"):
             page.on_show()
@@ -490,13 +492,11 @@ class ScanPage(tk.Frame):
         super().__init__(parent)
         self.controller = controller
 
-        # state
         self.batch_file: Path | None = None
         self.batch_str: str | None = None
         self.df_cache = pd.DataFrame(columns=["Timestamp", "Batch", "Value"])
         self.dirty = False
 
-        # Top bar
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=10, pady=10)
 
@@ -519,9 +519,7 @@ class ScanPage(tk.Frame):
         right = tk.Frame(outer)
         right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-        # =========================
-        # Camera controls (NEW)
-        # =========================
+        # Camera controls
         cam_bar = tk.Frame(left)
         cam_bar.pack(fill=tk.X, pady=(0, 8))
 
@@ -541,11 +539,10 @@ class ScanPage(tk.Frame):
         tk.Button(cam_bar, text="Connect", command=self.connect_camera).pack(side=tk.LEFT, padx=4)
         tk.Button(cam_bar, text="Disconnect", command=self.disconnect_camera).pack(side=tk.LEFT, padx=4)
 
-        # Live feed (Pi camera) — now NOT auto-started
         self.live = PiCameraLiveFeed(left, size=(960, 540), fps=20)
         self.live.pack(fill=tk.BOTH, expand=True)
 
-        # ---- Table ----
+        # Table
         tk.Label(right, text="Batch Data", font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
         table_frame = tk.Frame(right)
@@ -564,7 +561,7 @@ class ScanPage(tk.Frame):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # ---- Plot ----
+        # Plot
         tk.Label(right, text="Scan Values", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
 
         self.fig = Figure(figsize=(5.2, 3.5), dpi=100)
@@ -575,7 +572,7 @@ class ScanPage(tk.Frame):
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=False)
 
-        # ---- Buttons ----
+        # Buttons
         btn_row = tk.Frame(left)
         btn_row.pack(fill=tk.X, pady=(10, 0))
 
@@ -586,37 +583,19 @@ class ScanPage(tk.Frame):
         tk.Button(btn_row, text="Reload", command=self.reload_from_disk, width=10).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_row, text="Open Excel Folder", command=self.open_excel_folder, width=16).pack(side=tk.LEFT)
 
-    # =========================
-    # Camera selection logic (NEW)
-    # =========================
     def refresh_camera_list(self):
         """
-        Populate dropdown with available cameras.
-        If libcamera/picamera2 isn't available or no cameras found, show (none).
+        Since your Pi camera is already known to work with Picamera2(0),
+        just offer that directly instead of probing in a fragile way.
         """
-        cams = []
         try:
-            from picamera2 import Picamera2
-            infos = Picamera2.global_camera_info()  # list of dicts
-            for i, info in enumerate(infos):
-                # These keys vary; try a few
-                name = info.get("Model") or info.get("Name") or info.get("Id") or f"Camera {i}"
-                cams.append((i, str(name)))
+            from picamera2 import Picamera2  # import test only
+            _ = Picamera2  # silence unused warning
+            self.cam_combo["values"] = ["0: Raspberry Pi Camera"]
+            self.cam_var.set("0: Raspberry Pi Camera")
         except Exception:
-            cams = []
-
-        if not cams:
             self.cam_combo["values"] = ["(none)"]
             self.cam_var.set("(none)")
-            return
-
-        pretty = [f"{i}: {name}" for i, name in cams]
-        self.cam_combo["values"] = pretty
-
-        # Keep selection if still valid, else choose first
-        cur = self.cam_var.get()
-        if cur not in pretty:
-            self.cam_var.set(pretty[0])
 
     def _selected_camera_index(self) -> int | None:
         v = (self.cam_var.get() or "").strip()
@@ -643,9 +622,6 @@ class ScanPage(tk.Frame):
         self.live.disconnect()
         self._set_status("Camera disconnected.")
 
-    # =========================
-    # Navigation hooks (UPDATED)
-    # =========================
     def on_show(self):
         self.batch_file = self.controller.state.get("scan_batch_file")
         self.batch_str = self.controller.state.get("scan_batch_str")
@@ -658,18 +634,12 @@ class ScanPage(tk.Frame):
         self.dirty = False
         self.status_label.config(text=f"Ready • File: {self.batch_file.name}")
 
-        # IMPORTANT: do NOT auto-connect the camera
         self.refresh_camera_list()
-
         self.refresh_table_and_plot()
 
     def on_hide(self):
-        # Stop camera when leaving the page (safe even if not connected)
         self.live.disconnect()
 
-    # =========================
-    # Your existing scan/table/plot logic (same as before)
-    # =========================
     def _set_status(self, msg: str):
         suffix = " • Unsaved changes" if self.dirty else ""
         self.status_label.config(text=msg + suffix)
@@ -753,7 +723,7 @@ class ScanPage(tk.Frame):
             return
 
         try:
-            row_num = int(vals[0])  # 1-based
+            row_num = int(vals[0])
         except Exception:
             messagebox.showerror("Delete Error", "Could not determine selected row number.", parent=self)
             return
@@ -793,16 +763,15 @@ class ScanPage(tk.Frame):
             return
         _open_folder(self.batch_file.parent)
 
+
 # -------------------------
 # Page 3: Compare
 # -------------------------
-
 class ComparePage(tk.Frame):
     def __init__(self, parent, controller: App):
         super().__init__(parent)
         self.controller = controller
 
-        # runtime structures
         self.batch_files: list[Path] = []
         self.tab_tables: dict[Path, ttk.Treeview] = {}
 
@@ -825,12 +794,10 @@ class ComparePage(tk.Frame):
         right = tk.Frame(outer)
         right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-        # Selected list
         tk.Label(left, text="Selected Batches", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         self.listbox = tk.Listbox(left, height=5)
         self.listbox.pack(fill=tk.X, pady=(5, 10))
 
-        # Averages
         avg_frame = tk.LabelFrame(left, text="Averages", padx=8, pady=8)
         avg_frame.pack(fill=tk.X, pady=(0, 10))
 
@@ -842,12 +809,10 @@ class ComparePage(tk.Frame):
                                            justify="left", anchor="w")
         self.avg_combined_label.pack(fill=tk.X, pady=(6, 0))
 
-        # Tabs for tables
         tk.Label(left, text="Data (per batch)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         self.notebook = ttk.Notebook(left)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        # Plot
         tk.Label(right, text="Comparison Plot", font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
         self.fig = Figure(figsize=(6.8, 5.8), dpi=100)
@@ -891,19 +856,16 @@ class ComparePage(tk.Frame):
         return tree
 
     def rebuild_tabs(self):
-        # listbox
         self.listbox.delete(0, tk.END)
         for f in self.batch_files:
             b = _infer_batch_str_from_file(f)
             self.listbox.insert(tk.END, f"{b}  •  {f.name}")
 
-        # clear tabs
         for tab_id in self.notebook.tabs():
             self.notebook.forget(tab_id)
 
         self.tab_tables.clear()
 
-        # rebuild tabs
         for f in self.batch_files:
             b = _infer_batch_str_from_file(f)
             tab = tk.Frame(self.notebook)
@@ -915,7 +877,6 @@ class ComparePage(tk.Frame):
         self.ax.set_xlabel("Scan #")
         self.ax.set_ylabel("Value")
 
-        # clear tables
         for tree in self.tab_tables.values():
             for item in tree.get_children():
                 tree.delete(item)
@@ -928,7 +889,6 @@ class ComparePage(tk.Frame):
             df = _read_excel_df(f).copy()
             batch_label = _infer_batch_str_from_file(f)
 
-            # fill tab table
             tree = self.tab_tables.get(f)
             if tree:
                 for _, r in df.iterrows():
@@ -950,7 +910,6 @@ class ComparePage(tk.Frame):
                 self.ax.plot(x, vals, marker="o", label=batch_label)
                 any_series = True
 
-        # averages text
         lines = []
         for f in self.batch_files:
             b = _infer_batch_str_from_file(f)
@@ -977,6 +936,7 @@ class ComparePage(tk.Frame):
         if not self.batch_files:
             return
         _open_folder(self.batch_files[0].parent)
+
 
 if __name__ == "__main__":
     app = App()

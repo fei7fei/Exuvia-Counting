@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Remote Exuvia Counter
+Comment=Launch Exuvia Counter without opening a browser on the Pi
+Exec=/home/oksir/Desktop/start_exuvia_counter_remote.sh
+Path=/home/oksir/Desktop/Exuvia/Exuvia-Counting-main (1)/Exuvia-Counting-main/exuvia_app
+Terminal=false
+Icon=camera-photo
+Categories=Utility;
+StartupNotify=true

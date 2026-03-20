@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Exuvia Counter
+Comment=Launch Exuvia Camera Capture and Detection
+Exec=/home/oksir/Desktop/start_exuvia_counter.sh
+Path=/home/oksir/Desktop/Exuvia/Exuvia-Counting-main (1)/Exuvia-Counting-main/exuvia_app
+Terminal=true
+Icon=camera-photo
+Categories=Utility;
+StartupNotify=true
